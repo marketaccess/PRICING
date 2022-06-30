@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from datetime import date
+import sys
 import os
 import shutil
 from selfee_lib.utils.file_reader import read_M021
@@ -65,9 +66,9 @@ def load_conso(info):
                 print(colored(
                     '\nExit : Once M021 files requested, update the path in pricing_template.xlsx and rerun the script',
                     'red'))
-                return 0
-
-            conso = load_m021(path_M021, info.engine2)
+                sys.exit()
+            load_m021(path_M021, info.engine2)
+            conso = pd.read_sql(sql, info.engine2)
     return conso.dropna()
 
 
@@ -109,13 +110,15 @@ def couverture_optimale(df):
 def couts_des_ecarts(df):
     df['weekday'] = df.from_local_datetime.dt.weekday
     df['hour'] = df.from_local_datetime.dt.hour
-    mean_conso = df.groupby(['weekday', 'hour']).mean()[['conso']]
+    df['month'] = df.from_local_datetime.dt.month
+    mean_conso = df.groupby(['weekday', 'hour', 'month']).mean()[['conso']]
     mean_conso.columns = ['prev_conso']
-    ecarts = df.merge(mean_conso, left_on=['weekday', 'hour'], right_index=True)
+    ecarts = df.merge(mean_conso, left_on=['weekday', 'hour', 'month'], right_index=True)
 
     imbalance_prices = (np.abs(ecarts.prev_conso - ecarts.conso) * 0.1 * ecarts.prix_spot).sum()
     imbalance_cost = np.round(imbalance_prices / ecarts.conso.sum(), 2)
-    print('Coûts des écarts =', imbalance_cost, '€/MWh')
+    error = np.round(np.abs(ecarts.prev_conso - ecarts.conso).sum() / ecarts.conso.sum()*100,2)
+    print('Coûts des écarts =', imbalance_cost, '€/MWh pour une erreur de ', error, '%')
 
 
 def droit_arenh(data, info):
@@ -131,7 +134,7 @@ def droit_arenh(data, info):
 
     mask = (mask1 | mask4)
     pm = np.mean(df.loc[mask, 'conso'])
-    print("ARENH : ", (round(0.964 * pm, 2)), "MW")
+    print("droit ARENH = ", (round(0.964 * pm, 2)), "MW")
 
 
 def calculate_price(year, month_avg, month_peak_avg, data, info):
@@ -155,4 +158,52 @@ def calculate_price(year, month_avg, month_peak_avg, data, info):
     price_sans_arenh = np.round(df.achats_sans_arenh.sum() / df.conso.sum() + couts_ecarts, 2)
     mean_spot = np.round(df.prix_spot.mean(), 2)
     mean_spot_avg = np.round(month_peak_avg.mean(), 2)
-    return mean_spot, mean_spot_avg, price, price_sans_arenh
+    return price, price_sans_arenh
+
+
+
+def load_data(info):
+    conso = load_conso(info)
+    prod = info.prod
+    data = conso.merge(prod, on='from_utc_datetime', how='left').fillna(0)
+    return data
+
+
+def load_spot(data, info):
+    year = info.info.loc[0, 'valeur']
+    month_avg = info.spot['moyenne spot'].values
+    month_peak_avg = info.spot['moyenne peak'].values
+
+    spot = generate_spot_ref(year, month_avg, month_peak_avg, info)
+    df = data.merge(spot.drop('from_local_datetime', axis=1), on='from_utc_datetime')
+    path = info.info.loc[1, 'valeur'] + '.xlsx'
+    df.to_excel(path)
+    return df
+
+
+def get_price(data, info):
+    year = info.info.loc[0, 'valeur']
+    month_avg = info.spot['moyenne spot'].values
+    month_peak_avg = info.spot['moyenne peak'].values
+    price, price_sans_arenh = calculate_price(year, month_avg, month_peak_avg, data, info)
+    print('Prix avec ARENH =', price, '€/MWh')
+    print('Prix sans ARENH =', price_sans_arenh, '€/MWh \n')
+
+
+def print_hypothesis(info):
+    volume_arenh = info.info.loc[4, 'valeur']
+    volume_couverture = info.info.loc[7, 'valeur']
+    prix_arenh = info.info.loc[5, 'valeur']
+    prix_couverture = info.info.loc[8, 'valeur']
+    prod_coef = info.info.loc[10, 'valeur'] / 100
+    prix_prod = info.info.loc[11, 'valeur']
+    couts_ecarts = info.info.loc[13, 'valeur']
+    month_avg = info.spot['moyenne spot'].values
+    month_peak_avg = info.spot['moyenne peak'].values
+
+    print('\nHypothèses : ')
+    print('  - Volume ARENH =', volume_arenh, 'MW')
+    print('  - Volume Couverture =', volume_couverture, 'MW')
+    print('  - Prix Couverture =', prix_couverture, '€/MWh')
+    print('  - Moyenne Spot =', np.round(month_avg.mean(), 2), '€/MWh')
+    print('  - Moyenne Spot peak =', np.round(month_peak_avg.mean(), 2), '€/MWh\n')
